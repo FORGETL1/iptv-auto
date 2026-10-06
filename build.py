@@ -359,6 +359,57 @@ def probe_curl(url):
         return False, "超时/失败"
 
 
+# ---- 深度校验：浅探测只能证明「服务器有响应」，证明不了「能播出画面」。
+#      大量源返回 200/302 但正文根本不是播放列表，或者分片 404 ——
+#      这种「假活」线路排在前面，播放器就会一直黑屏转圈。
+#      所以对真正要写进结果的线路，再验证两步：能解析出分片 + 首个分片能下载。
+_opener_follow = urllib.request.build_opener()      # 默认跟随跳转
+_opener_follow.addheaders = [("User-Agent", UA), ("Accept", "*/*")]
+
+
+def _get(url, timeout=10, maxbytes=200000):
+    with _opener_follow.open(url, timeout=timeout) as r:
+        return r.getcode(), (r.headers.get("Content-Type") or "").lower(), \
+               r.read(maxbytes), r.geturl()
+
+
+def deep_probe(url):
+    """能拿到播放列表 + 首个分片确实有视频数据 → 才算真能播"""
+    try:
+        url.encode("ascii")
+    except UnicodeEncodeError:
+        p = url.split("://", 1)
+        url = p[0] + "://" + quote(p[1], safe=":/?&=%#[]@!$()*+,;~")
+    try:
+        code, ct, body, final = _get(url)
+    except Exception:                      # noqa: BLE001
+        return False, "连接失败"
+    if code not in (200, 206):
+        return False, "HTTP %s" % code
+    text = body.decode("utf-8", "ignore")
+    if "#EXTM3U" not in text:
+        # 不是播放列表，可能是直接的 TS/FLV 流
+        if ct.startswith("video/") or "octet-stream" in ct or "mp2t" in ct:
+            return len(body) > 1000, ("直连流" if len(body) > 1000 else "数据过小")
+        return False, "非播放列表"
+    segs = [l.strip() for l in text.splitlines()
+            if l.strip() and not l.startswith("#")]
+    if not segs:
+        return False, "空播放列表"
+    seg = urljoin(final or url, segs[0])
+    try:
+        code2, ct2, body2, _ = _get(seg, timeout=8, maxbytes=65536)
+    except Exception:                      # noqa: BLE001
+        return False, "分片取不到"
+    if code2 not in (200, 206):
+        return False, "分片 HTTP %s" % code2
+    if len(body2) < 1000:
+        return False, "分片过小"
+    if ct2.startswith("text/html"):
+        return False, "分片是网页"
+    return True, "分片 OK"
+
+
 # ---------------------------------------------------------------- 主流程
 
 def main():
@@ -368,6 +419,12 @@ def main():
     ap.add_argument("--max-probe", type=int, default=0, help="最多探测多少条 URL，0=不限")
     ap.add_argument("--workers", type=int, default=80)
     ap.add_argument("--cache", default=None, help="探测结果缓存文件，重跑时复用")
+    ap.add_argument("--deep", dest="deep", action="store_true", default=True,
+                    help="深校验：确认线路真能拉到视频分片（默认开）")
+    ap.add_argument("--no-deep", dest="deep", action="store_false",
+                    help="关闭深校验，只做 HTTP 浅探测（快，但会混入黑屏源）")
+    ap.add_argument("--deep-try", type=int, default=8,
+                    help="每个频道最多深校验几条候选线路")
     # 供 .bat / 计划任务透传，避免「unrecognized arguments」；不影响脚本行为
     ap.add_argument("--silent", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
@@ -377,6 +434,7 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     # 缓存放在脚本旁边而不是输出目录，避免被一起发布出去
     cache_path = args.cache or os.path.join(here, ".probe_cache.json")
+    deep_cache_path = os.path.join(here, ".deep_cache.json")
 
     probe = probe_curl if args.engine == "curl" else probe_urllib
 
@@ -443,7 +501,7 @@ def main():
     n_alive = sum(1 for e in uniq if cache.get(e["url"], [False])[0])
     print("    探测 %d 条，用时 %.0fs；本机可达 %d 条" % (len(todo), time.time() - t0, n_alive))
 
-    print("[4/4] 生成播放列表 …")
+    print("[4/5] 深校验：确认线路真能播出画面 …")
     alive = lambda u: cache.get(u, [False])[0]          # noqa: E731
 
     bykey = {}
@@ -452,11 +510,64 @@ def main():
     for k in bykey:
         bykey[k].sort(key=lambda x: (not alive(x["url"]), x["w"], x.get("rt", 9999)))
 
+    deep_cache = {}
+    if os.path.exists(deep_cache_path):
+        try:
+            deep_cache = json.load(open(deep_cache_path, encoding="utf-8"))
+        except Exception:                  # noqa: BLE001
+            deep_cache = {}
+
+    cand = []
+    if args.deep:
+        # 只校验「真正可能被写进结果」的候选：每个频道前 deep_try 条可达线路
+        for k, v in bykey.items():
+            n = 0
+            for e in v:
+                if n >= args.deep_try:
+                    break
+                if alive(e["url"]):
+                    cand.append(e["url"])
+                    n += 1
+        todo = [u for u in cand if u not in deep_cache]
+        t1 = time.time()
+        print("    候选 %d 条，需校验 %d 条 …" % (len(cand), len(todo)))
+        if todo:
+            done = 0
+            with ThreadPoolExecutor(max_workers=args.workers) as ex:
+                futs = {ex.submit(deep_probe, u): u for u in todo}
+                for f in as_completed(futs):
+                    u = futs[f]
+                    try:
+                        ok, note = f.result()
+                    except Exception as e:     # noqa: BLE001
+                        ok, note = False, type(e).__name__
+                    deep_cache[u] = [ok, note]
+                    done += 1
+                    if done % 200 == 0:
+                        print("      %d/%d  %.0fs" % (done, len(todo), time.time() - t1))
+            json.dump(deep_cache, open(deep_cache_path, "w", encoding="utf-8"),
+                      ensure_ascii=False)
+        n_play = sum(1 for u in cand if deep_cache.get(u, [False])[0])
+        print("    用时 %.0fs；%d/%d 条能真正拉到视频分片"
+              % (time.time() - t1, n_play, len(cand)))
+
+    def is_play(u):
+        return deep_cache.get(u, [False])[0]
+
+    def tag_of(e):
+        if is_play(e["url"]):
+            return "已验证可播"
+        if alive(e["url"]):
+            return "仅通HTTP"
+        return "备用线路"
+
     def best_of(v, n=2):
+        """优先级：能播出画面 > 只通了 HTTP > 其余。组播播放器播不了，排除。"""
         v = [e for e in v if not re.match(r"^(rtp|udp|igmp)://", e["url"])]
-        a = [e for e in v if alive(e["url"])]
-        b = [e for e in v if not alive(e["url"])]
-        return (a + b)[:n]
+        a = [e for e in v if is_play(e["url"])]
+        b = [e for e in v if not is_play(e["url"]) and alive(e["url"])]
+        c = [e for e in v if not alive(e["url"])]
+        return (a + b + c)[:n]
 
     def sortkey(g, k):
         if g == "央视频道":
@@ -474,17 +585,19 @@ def main():
     curated = [(g, k, v) for (g, k, v) in ordered
                if g != "其他频道" and not is_junk(v[0]) and best_of(v)]
 
+    print("[5/5] 生成播放列表 …")
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     lines = ['#EXTM3U x-tvg-url="%s"' % EPG_URLS,
              "# 自动生成于 %s | 由 %d 份公开源合并去重" % (stamp, len(SOURCES)),
-             "# (本机可达) = 生成时实测可连通；(备用线路) = 同频道备选"]
+             "# (已验证可播) = 生成时真的拉到了视频分片，优先播这些",
+             "# (仅通HTTP) = 服务器有响应但没验到分片；(备用线路) = 同频道备选"]
     for g, k, v in curated:
         for e in best_of(v):
             name = pretty_name(k)
-            tag = "本机可达" if alive(e["url"]) else "备用线路"
             lines.append('#EXTINF:-1 tvg-id="%s" tvg-name="%s" tvg-logo="%s" '
                          'group-title="%s",%s (%s)'
-                         % (e.get("tvgid") or k, name, e.get("logo") or "", g, name, tag))
+                         % (e.get("tvgid") or k, name, e.get("logo") or "", g,
+                            name, tag_of(e)))
             lines.append(e["url"])
     open(os.path.join(outdir, "直播源-精选.m3u"), "w", encoding="utf-8").write(
         "\n".join(lines) + "\n")
@@ -504,26 +617,30 @@ def main():
     with open(os.path.join(outdir, "频道清单.csv"), "w", encoding="utf-8-sig",
               newline="") as f:
         w = csv.writer(f)
-        w.writerow(["分组", "频道名", "可达线路数", "首选线路"])
+        w.writerow(["分组", "频道名", "可播线路数", "首选线路", "线路状态"])
         for g, k, v in curated:
-            w.writerow([g, pretty_name(k), sum(1 for e in v if alive(e["url"])),
-                        best_of(v)[0]["url"]])
+            sel = best_of(v)
+            w.writerow([g, pretty_name(k),
+                        sum(1 for e in v if is_play(e["url"])),
+                        sel[0]["url"], tag_of(sel[0])])
 
     stats = {}
     for g, k, v in curated:
         stats.setdefault(g, [0, 0])
         stats[g][0] += 1
-        if any(alive(e["url"]) for e in best_of(v)):
+        if any(is_play(e["url"]) for e in best_of(v)):
             stats[g][1] += 1
     report = {"生成时间": stamp, "原始条目": len(entries), "去重后": len(uniq),
-              "本机可达": n_alive, "精选频道数": len(curated),
-              "有可达线路的频道": sum(v[1] for v in stats.values()),
-              "分组": {k: {"频道数": v[0], "含可达线路": v[1]} for k, v in stats.items()}}
+              "本机可达": n_alive, "深校验候选": len(cand),
+              "确认可播": sum(1 for u in cand if is_play(u)),
+              "精选频道数": len(curated),
+              "有可播线路的频道": sum(v[1] for v in stats.values()),
+              "分组": {k: {"频道数": v[0], "含可播线路": v[1]} for k, v in stats.items()}}
     json.dump(report, open(os.path.join(outdir, "stats.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=2)
 
-    print("    精选 %d 个频道，其中 %d 个含实测可达线路"
-          % (len(curated), report["有可达线路的频道"]))
+    print("    精选 %d 个频道，其中 %d 个含确认可播线路"
+          % (len(curated), report["有可播线路的频道"]))
     print("    输出目录：%s" % outdir)
     return 0
 
