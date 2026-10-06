@@ -1,0 +1,44 @@
+name: 每日更新直播源
+
+on:
+  schedule:
+    # UTC 17:20 = 北京时间 01:20（避开整点，GitHub 定时任务在整点容易排队延迟）
+    - cron: "20 17 * * *"
+  workflow_dispatch:      # 支持在 Actions 页面手动点一下立即运行
+  push:
+    branches: [ main ]    # 改动 main 也跑一次，方便验证
+
+permissions:
+  contents: write         # 需要写权限才能把结果推到 output 分支
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 生成直播源
+        run: python build.py --outdir out
+
+      - name: 结果摘要
+        run: |
+          cat out/stats.json
+          echo "频道数：$(grep -c '^#EXTINF' out/直播源-精选.m3u || true)"
+
+      - name: 发布到 output 分支
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: output
+          publish_dir: ./out
+          force_orphan: true
+          commit_message: "自动更新直播源"
